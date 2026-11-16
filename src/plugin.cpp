@@ -8,6 +8,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <vector>
+#include "speech_hash.h"
 
 namespace {
 using Keyboard = void(*)(DWORD, WORD, BYTE, BOOL, BOOL, BOOL, BOOL);
@@ -67,7 +68,7 @@ void openLog() {
                 nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         }
     }
-    log("ATTACH TauntKey v0.4 diagnostics; pid=%lu", GetCurrentProcessId());
+    log("ATTACH TauntKey v0.5 diagnostics; pid=%lu", GetCurrentProcessId());
 }
 
 template<class T> bool resolve(HMODULE mod, T& out, const char* name) {
@@ -113,16 +114,6 @@ template<class T> bool readMemory(std::uintptr_t address, T& value) {
     return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address),
         &value, sizeof(value), &count) && count == sizeof(value);
 }
-std::uint32_t nameHash(const char* name) {
-    std::uint32_t h = 0;
-    for (; *name; ++name) {
-        unsigned char c = static_cast<unsigned char>(*name);
-        if (c >= 'A' && c <= 'Z') c += 'a'-'A';
-        h += c; h += h << 10; h ^= h >> 6;
-    }
-    h += h << 3; h ^= h >> 11; h += h << 15;
-    return h;
-}
 bool contextTable(std::uintptr_t& table, int& count) {
     const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
     IMAGE_DOS_HEADER dos{}; IMAGE_NT_HEADERS64 nt{};
@@ -144,20 +135,21 @@ bool contextTable(std::uintptr_t& table, int& count) {
     log("CONTEXT table entries=%d", count);
     return true;
 }
-bool selectTaunt(int player) {
+int selectTaunt(int player) {
     std::uintptr_t table = 0; int count = 0;
-    if (!contextTable(table,count)) return false;
+    if (!contextTable(table,count)) return -1;
     std::vector<unsigned char> entries(static_cast<size_t>(count)*0x9c);
     SIZE_T copied = 0;
     if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(table), entries.data(),
         entries.size(), &copied) || copied != entries.size()) {
-        log("CONTEXT table bulk read failed"); return false;
+        log("CONTEXT table bulk read failed"); return -1;
     }
     const int model = call<0x0B28E9EC,int>(player);
     const char* names[] = {"PLAYER_TAUNT_GENERIC", "PLAYER_TAUNT", "PLAYER_TAUNT_LAW", "PLAYER_TAUNT_CRIMINAL", "PLAYER_GREET", "PLAYER_GREET_VIRTUAL"};
     const char* chosen = nullptr;
+    int chosenId = -1;
     for (unsigned n = 0; n < sizeof(names)/sizeof(names[0]); ++n) {
-        const std::uint32_t hash = nameHash(names[n]);
+        const std::uint32_t hash = speechNameHash(names[n]);
         int id = -1;
         for (int i = 0; i < count; ++i) {
             std::uint32_t stored = 0;
@@ -167,11 +159,11 @@ bool selectTaunt(int player) {
         int playable = id < 0 ? -1 : call<0xD02757C1,int>(model,id);
         log("CONTEXT name=%s hash=%08X id=%d model=%d modelHasPhrase=%d",names[n],hash,id,model,playable);
         // Prefer generic taunts; law/criminal and greeting contexts are diagnostic only.
-        if (n < 2 && playable == 1 && !chosen) chosen = names[n];
+        if (n < 2 && playable == 1 && !chosen) { chosen = names[n]; chosenId = id; }
     }
-    if (!chosen) { log("SKIP no generic taunt context with phrases for player model; no blind speech request"); return false; }
+    if (!chosen) { log("SKIP no generic taunt context with phrases for player model; no blind speech request"); return -1; }
     std::strcpy(context, chosen);
-    return true;
+    return chosenId;
 }
 struct Vec3 { float x, y, z; };
 static_assert(sizeof(void*) == 8 && sizeof(Vec3) == 12);
@@ -263,11 +255,15 @@ void script() {
                             call<0x030FB1FA>(player, target, taskSeconds);
                             requested = true;
                         }
-                    } else if (selectTaunt(player)) {
-                        // This native has no target argument. Never gate it on an iterator.
-                        log("REQUEST speech player=%d context=%s hash=BA734A15", player,context);
-                        call<0xBA734A15>(player, static_cast<const char*>(context), true, false, 1, 0, false, false);
-                        requested = true;
+                    } else {
+                        int contextId = selectTaunt(player);
+                        if (contextId >= 0) {
+                            // Native context path sets the engine's context flags, unlike
+                            // SAY_SINGLE_LINE_STRING. Backup context IDs use -1 (none).
+                            log("REQUEST context player=%d name=%s id=%d hash=31BAF169", player,context,contextId);
+                            call<0x31BAF169>(player, contextId, -1, true, false, 1, -1, -1, 0, false);
+                            requested = true;
+                        }
                     }
                     log("ATTEMPT completed elapsed=%llu ms requested=%d", GetTickCount64()-started, requested);
                     // Reserve cooldown even when task lookup fails.
