@@ -7,6 +7,7 @@
 #include <type_traits>
 #include <cstdarg>
 #include <cstdio>
+#include <vector>
 
 namespace {
 using Keyboard = void(*)(DWORD, WORD, BYTE, BOOL, BOOL, BOOL, BOOL);
@@ -66,7 +67,7 @@ void openLog() {
                 nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         }
     }
-    log("ATTACH TauntKey v0.3 diagnostics; pid=%lu", GetCurrentProcessId());
+    log("ATTACH TauntKey v0.4 diagnostics; pid=%lu", GetCurrentProcessId());
 }
 
 template<class T> bool resolve(HMODULE mod, T& out, const char* name) {
@@ -104,6 +105,73 @@ Result call(Args... args) {
         if (result) std::memcpy(&value, result, sizeof(value));
         return value;
     }
+}
+// Read-only inspection of context IDs; only for the supplied RDR executable build.
+// Never call internal addresses or write game memory.
+template<class T> bool readMemory(std::uintptr_t address, T& value) {
+    SIZE_T count = 0;
+    return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address),
+        &value, sizeof(value), &count) && count == sizeof(value);
+}
+std::uint32_t nameHash(const char* name) {
+    std::uint32_t h = 0;
+    for (; *name; ++name) {
+        unsigned char c = static_cast<unsigned char>(*name);
+        if (c >= 'A' && c <= 'Z') c += 'a'-'A';
+        h += c; h += h << 10; h ^= h >> 6;
+    }
+    h += h << 3; h ^= h >> 11; h += h << 15;
+    return h;
+}
+bool contextTable(std::uintptr_t& table, int& count) {
+    const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    IMAGE_DOS_HEADER dos{}; IMAGE_NT_HEADERS64 nt{};
+    if (!readMemory(base,dos) || dos.e_magic != IMAGE_DOS_SIGNATURE ||
+        dos.e_lfanew < 0 || dos.e_lfanew > 4096 ||
+        !readMemory(base+dos.e_lfanew,nt) || nt.Signature != IMAGE_NT_SIGNATURE ||
+        nt.FileHeader.TimeDateStamp != 0x6711591d || nt.OptionalHeader.SizeOfImage != 0x5a5dd600) {
+        log("CONTEXT inspection disabled: executable build differs from supplied EXE"); return false;
+    }
+    const unsigned char expected[24] = {0x48,0x89,0x5c,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x57,0x48,0x83,0xec,0x30,0x48,0x8b,0x41,0x10,0x48,0x8b,0xd9,0x8b,0x70};
+    unsigned char actual[24]{};
+    if (!readMemory(base+0xe26650,actual) || std::memcmp(actual,expected,sizeof(actual)) != 0) {
+        log("CONTEXT inspection disabled: handler signature mismatch"); return false;
+    }
+    if (!readMemory(base+0x2ad4180,count) || !readMemory(base+0x2c26da8,table) ||
+        count <= 0 || count > 8192 || !table) {
+        log("CONTEXT table unavailable count=%d",count); return false;
+    }
+    log("CONTEXT table entries=%d", count);
+    return true;
+}
+bool selectTaunt(int player) {
+    std::uintptr_t table = 0; int count = 0;
+    if (!contextTable(table,count)) return false;
+    std::vector<unsigned char> entries(static_cast<size_t>(count)*0x9c);
+    SIZE_T copied = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(table), entries.data(),
+        entries.size(), &copied) || copied != entries.size()) {
+        log("CONTEXT table bulk read failed"); return false;
+    }
+    const int model = call<0x0B28E9EC,int>(player);
+    const char* names[] = {"PLAYER_TAUNT_GENERIC", "PLAYER_TAUNT", "PLAYER_TAUNT_LAW", "PLAYER_TAUNT_CRIMINAL", "PLAYER_GREET", "PLAYER_GREET_VIRTUAL"};
+    const char* chosen = nullptr;
+    for (unsigned n = 0; n < sizeof(names)/sizeof(names[0]); ++n) {
+        const std::uint32_t hash = nameHash(names[n]);
+        int id = -1;
+        for (int i = 0; i < count; ++i) {
+            std::uint32_t stored = 0;
+            std::memcpy(&stored, entries.data()+static_cast<size_t>(i)*0x9c+0x94, sizeof(stored));
+            if (stored == hash) { id = i; break; }
+        }
+        int playable = id < 0 ? -1 : call<0xD02757C1,int>(model,id);
+        log("CONTEXT name=%s hash=%08X id=%d model=%d modelHasPhrase=%d",names[n],hash,id,model,playable);
+        // Prefer generic taunts; law/criminal and greeting contexts are diagnostic only.
+        if (n < 2 && playable == 1 && !chosen) chosen = names[n];
+    }
+    if (!chosen) { log("SKIP no generic taunt context with phrases for player model; no blind speech request"); return false; }
+    std::strcpy(context, chosen);
+    return true;
 }
 struct Vec3 { float x, y, z; };
 static_assert(sizeof(void*) == 8 && sizeof(Vec3) == 12);
@@ -195,7 +263,7 @@ void script() {
                             call<0x030FB1FA>(player, target, taskSeconds);
                             requested = true;
                         }
-                    } else {
+                    } else if (selectTaunt(player)) {
                         // This native has no target argument. Never gate it on an iterator.
                         log("REQUEST speech player=%d context=%s hash=BA734A15", player,context);
                         call<0xBA734A15>(player, static_cast<const char*>(context), true, false, 1, 0, false, false);
