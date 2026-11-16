@@ -66,7 +66,7 @@ void openLog() {
                 nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         }
     }
-    log("ATTACH TauntKey v0.8 target-search; pid=%lu", GetCurrentProcessId());
+    log("ATTACH TauntKey v0.9 iterator-scope; pid=%lu", GetCurrentProcessId());
 }
 
 template<class T> bool resolve(HMODULE mod, T& out, const char* name) {
@@ -125,8 +125,12 @@ int nearestTarget(int player) {
     if (type != 1) { log("SKIP search root is not a layout"); return 0; }
     int iterator = call<0xD8A12B74,int>(root);
     if (!call<0x5A9CC0B0,bool>(iterator)) { log("SKIP invalid search iterator"); return 0; }
+    // Creation gives the iterator an owner, not its search domain.
+    // ITERATE_IN_LAYOUT sets +0x70 and enables the search domain (+0xFC bit 2).
+    call<0xF3ABE99C>(iterator,root);
     call<0xBE553F84>(iterator,15);
     call<0xF35C5859>(iterator);
+    log("SEARCH iterator=%d scope=%d configured",iterator,root);
     const Vec3 origin=position(player);
     float bestDistance=radius*radius;
     int best=0, count=0;
