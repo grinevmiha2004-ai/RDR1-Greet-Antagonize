@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <vector>
 #include "speech_hash.h"
+#include "taunt_selection.h"
 
 namespace {
 using Keyboard = void(*)(DWORD, WORD, BYTE, BOOL, BOOL, BOOL, BOOL);
@@ -68,7 +69,7 @@ void openLog() {
                 nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         }
     }
-    log("ATTACH TauntKey v0.5 diagnostics; pid=%lu", GetCurrentProcessId());
+    log("ATTACH TauntKey v0.6 diagnostics; pid=%lu", GetCurrentProcessId());
 }
 
 template<class T> bool resolve(HMODULE mod, T& out, const char* name) {
@@ -145,9 +146,8 @@ int selectTaunt(int player) {
         log("CONTEXT table bulk read failed"); return -1;
     }
     const int model = call<0x0B28E9EC,int>(player);
-    const char* names[] = {"PLAYER_TAUNT_GENERIC", "PLAYER_TAUNT", "PLAYER_TAUNT_LAW", "PLAYER_TAUNT_CRIMINAL", "PLAYER_GREET", "PLAYER_GREET_VIRTUAL"};
-    const char* chosen = nullptr;
-    int chosenId = -1;
+    const char* names[] = {"PLAYER_TAUNT_GENERIC", "PLAYER_TAUNT", "PLAYER_TAUNT_CRIMINAL", "PLAYER_TAUNT_LAW", "PLAYER_GREET", "PLAYER_GREET_VIRTUAL"};
+    std::array<int,4> ids{{-1,-1,-1,-1}}, available{{-1,-1,-1,-1}};
     for (unsigned n = 0; n < sizeof(names)/sizeof(names[0]); ++n) {
         const std::uint32_t hash = speechNameHash(names[n]);
         int id = -1;
@@ -158,12 +158,13 @@ int selectTaunt(int player) {
         }
         int playable = id < 0 ? -1 : call<0xD02757C1,int>(model,id);
         log("CONTEXT name=%s hash=%08X id=%d model=%d modelHasPhrase=%d",names[n],hash,id,model,playable);
-        // Prefer generic taunts; law/criminal and greeting contexts are diagnostic only.
-        if (n < 2 && playable == 1 && !chosen) { chosen = names[n]; chosenId = id; }
+        if (n < ids.size()) { ids[n] = id; available[n] = playable; }
     }
-    if (!chosen) { log("SKIP no generic taunt context with phrases for player model; no blind speech request"); return -1; }
-    std::strcpy(context, chosen);
-    return chosenId;
+    int index = chooseTaunt(ids,available);
+    if (index < 0) { log("SKIP no available taunt context for player model"); return -1; }
+    std::strcpy(context, names[index]);
+    log("SELECTED name=%s id=%d modelHasPhrase=1", context, ids[index]);
+    return ids[index];
 }
 struct Vec3 { float x, y, z; };
 static_assert(sizeof(void*) == 8 && sizeof(Vec3) == 12);
