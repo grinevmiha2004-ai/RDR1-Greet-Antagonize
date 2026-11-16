@@ -29,7 +29,6 @@ ULONGLONG cooldown = 4000;
 HMODULE self;
 bool registered = false;
 HANDLE logFile = INVALID_HANDLE_VALUE;
-LONG traceBudget = 0;
 bool taskMode = false;
 char context[96] = "PLAYER_TAUNT_GENERIC";
 void log(const char* format, ...) {
@@ -47,7 +46,6 @@ void log(const char* format, ...) {
     line[length++]='\r'; line[length++]='\n';
     DWORD written = 0;
     WriteFile(logFile, line, static_cast<DWORD>(length), &written, nullptr);
-    FlushFileBuffers(logFile);
 }
 void openLog() {
     wchar_t path[MAX_PATH]{};
@@ -68,7 +66,7 @@ void openLog() {
                 nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         }
     }
-    log("ATTACH TauntKey v0.2 diagnostics; pid=%lu", GetCurrentProcessId());
+    log("ATTACH TauntKey v0.3 diagnostics; pid=%lu", GetCurrentProcessId());
 }
 
 template<class T> bool resolve(HMODULE mod, T& out, const char* name) {
@@ -98,12 +96,9 @@ template<class T> void push(T value) {
 }
 template<std::uint32_t Hash, class Result = void, class... Args>
 Result call(Args... args) {
-    bool tracing = traceBudget > 0;
-    if (tracing) { --traceBudget; log("NATIVE begin 0x%08X", Hash); }
     hook.nativeInit(Hash);
     (push(args), ...);
     auto result = hook.nativeCall();
-    if (tracing) log("NATIVE end   0x%08X result=%s", Hash, result ? "present" : "null");
     if constexpr (!std::is_void_v<Result>) {
         Result value{};
         if (result) std::memcpy(&value, result, sizeof(value));
@@ -177,9 +172,9 @@ void script() {
             log("HEARTBEAT script running foreground=%d", foreground());
             beat = now + 10000;
         }
-        if (polled || callback) {
+        // Polling is the only activation source. Delayed callbacks are diagnostic only.
+        if (polled) {
             log("KEY key=%lu polling=%d callback=%d", key, polled, callback);
-            traceBudget = 160;
             if (!foreground()) log("SKIP game window is not foreground");
             else if (now < next) log("SKIP cooldown remaining=%llu ms", next-now);
             else if (call<0x57246C02, bool>()) log("SKIP game paused");
@@ -190,27 +185,32 @@ void script() {
                 if (!alive(player)) log("SKIP player invalid or dead");
                 else if (call<0x2B74A6D6, bool>(player)) log("SKIP player already speaking");
                 else {
-                    int target = nearest(player);
-                    if (!alive(target)) log("SKIP no living NPC within radius");
-                    else {
-                        if (taskMode) {
+                    bool requested = false;
+                    const ULONGLONG started = GetTickCount64();
+                    if (taskMode) {
+                        int target = nearest(player);
+                        if (!alive(target)) log("SKIP task mode: no living NPC within radius");
+                        else {
                             log("REQUEST task player=%d target=%d parameter=%.1f", player,target,taskSeconds);
                             call<0x030FB1FA>(player, target, taskSeconds);
-                        } else {
-                            // String argument stays 64-bit. Signature confirmed in supplied EXE.
-                            // This request has no target argument; nearest NPC gates activation only.
-                            log("REQUEST speech player=%d nearby=%d context=%s", player,target,context);
-                            call<0xBA734A15>(player, static_cast<const char*>(context), true, false, 1, 0, false, false);
+                            requested = true;
                         }
-                        log("REQUEST returned; this does not establish audio playback");
+                    } else {
+                        // This native has no target argument. Never gate it on an iterator.
+                        log("REQUEST speech player=%d context=%s hash=BA734A15", player,context);
+                        call<0xBA734A15>(player, static_cast<const char*>(context), true, false, 1, 0, false, false);
+                        requested = true;
+                    }
+                    log("ATTEMPT completed elapsed=%llu ms requested=%d", GetTickCount64()-started, requested);
+                    // Reserve cooldown even when task lookup fails.
+                    next = GetTickCount64() + cooldown;
+                    if (requested) {
                         observedPlayer = player;
-                        observeStart = now;
-                        observeNext = now + 250;
-                        next = now + cooldown;
+                        observeStart = GetTickCount64();
+                        observeNext = observeStart + 250;
                     }
                 }
             }
-            traceBudget = 0;
         }
         if (observedPlayer && now >= observeNext) {
             if (!valid(observedPlayer)) {
