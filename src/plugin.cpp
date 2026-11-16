@@ -7,9 +7,6 @@
 #include <type_traits>
 #include <cstdarg>
 #include <cstdio>
-#include <vector>
-#include "speech_hash.h"
-#include "taunt_selection.h"
 
 namespace {
 using Keyboard = void(*)(DWORD, WORD, BYTE, BOOL, BOOL, BOOL, BOOL);
@@ -32,8 +29,7 @@ ULONGLONG cooldown = 4000;
 HMODULE self;
 bool registered = false;
 HANDLE logFile = INVALID_HANDLE_VALUE;
-bool taskMode = false;
-char context[96] = "PLAYER_TAUNT_GENERIC";
+
 void log(const char* format, ...) {
     if (logFile == INVALID_HANDLE_VALUE) return;
     SYSTEMTIME t{};
@@ -69,7 +65,7 @@ void openLog() {
                 nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         }
     }
-    log("ATTACH TauntKey v0.6 diagnostics; pid=%lu", GetCurrentProcessId());
+    log("ATTACH TauntKey v0.7 native-task; pid=%lu", GetCurrentProcessId());
 }
 
 template<class T> bool resolve(HMODULE mod, T& out, const char* name) {
@@ -108,64 +104,6 @@ Result call(Args... args) {
         return value;
     }
 }
-// Read-only inspection of context IDs; only for the supplied RDR executable build.
-// Never call internal addresses or write game memory.
-template<class T> bool readMemory(std::uintptr_t address, T& value) {
-    SIZE_T count = 0;
-    return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address),
-        &value, sizeof(value), &count) && count == sizeof(value);
-}
-bool contextTable(std::uintptr_t& table, int& count) {
-    const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
-    IMAGE_DOS_HEADER dos{}; IMAGE_NT_HEADERS64 nt{};
-    if (!readMemory(base,dos) || dos.e_magic != IMAGE_DOS_SIGNATURE ||
-        dos.e_lfanew < 0 || dos.e_lfanew > 4096 ||
-        !readMemory(base+dos.e_lfanew,nt) || nt.Signature != IMAGE_NT_SIGNATURE ||
-        nt.FileHeader.TimeDateStamp != 0x6711591d || nt.OptionalHeader.SizeOfImage != 0x5a5dd600) {
-        log("CONTEXT inspection disabled: executable build differs from supplied EXE"); return false;
-    }
-    const unsigned char expected[24] = {0x48,0x89,0x5c,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x57,0x48,0x83,0xec,0x30,0x48,0x8b,0x41,0x10,0x48,0x8b,0xd9,0x8b,0x70};
-    unsigned char actual[24]{};
-    if (!readMemory(base+0xe26650,actual) || std::memcmp(actual,expected,sizeof(actual)) != 0) {
-        log("CONTEXT inspection disabled: handler signature mismatch"); return false;
-    }
-    if (!readMemory(base+0x2ad4180,count) || !readMemory(base+0x2c26da8,table) ||
-        count <= 0 || count > 8192 || !table) {
-        log("CONTEXT table unavailable count=%d",count); return false;
-    }
-    log("CONTEXT table entries=%d", count);
-    return true;
-}
-int selectTaunt(int player) {
-    std::uintptr_t table = 0; int count = 0;
-    if (!contextTable(table,count)) return -1;
-    std::vector<unsigned char> entries(static_cast<size_t>(count)*0x9c);
-    SIZE_T copied = 0;
-    if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(table), entries.data(),
-        entries.size(), &copied) || copied != entries.size()) {
-        log("CONTEXT table bulk read failed"); return -1;
-    }
-    const int model = call<0x0B28E9EC,int>(player);
-    const char* names[] = {"PLAYER_TAUNT_GENERIC", "PLAYER_TAUNT", "PLAYER_TAUNT_CRIMINAL", "PLAYER_TAUNT_LAW", "PLAYER_GREET", "PLAYER_GREET_VIRTUAL"};
-    std::array<int,4> ids{{-1,-1,-1,-1}}, available{{-1,-1,-1,-1}};
-    for (unsigned n = 0; n < sizeof(names)/sizeof(names[0]); ++n) {
-        const std::uint32_t hash = speechNameHash(names[n]);
-        int id = -1;
-        for (int i = 0; i < count; ++i) {
-            std::uint32_t stored = 0;
-            std::memcpy(&stored, entries.data()+static_cast<size_t>(i)*0x9c+0x94, sizeof(stored));
-            if (stored == hash) { id = i; break; }
-        }
-        int playable = id < 0 ? -1 : call<0xD02757C1,int>(model,id);
-        log("CONTEXT name=%s hash=%08X id=%d model=%d modelHasPhrase=%d",names[n],hash,id,model,playable);
-        if (n < ids.size()) { ids[n] = id; available[n] = playable; }
-    }
-    int index = chooseTaunt(ids,available);
-    if (index < 0) { log("SKIP no available taunt context for player model"); return -1; }
-    std::strcpy(context, names[index]);
-    log("SELECTED name=%s id=%d modelHasPhrase=1", context, ids[index]);
-    return ids[index];
-}
 struct Vec3 { float x, y, z; };
 static_assert(sizeof(void*) == 8 && sizeof(Vec3) == 12);
 bool valid(int actor) { return call<0xBA6C3E92, bool>(actor); }
@@ -175,38 +113,21 @@ Vec3 position(int actor) {
     call<0x99BD9D6F>(actor, &v);
     return v;
 }
-int nearest(int player) {
-    int layout = call<0x51D6DA2C, int>(player); // GET_LAYOUT_FROM_OBJECT
-    log("SEARCH layout=%d", layout);
-    if (!call<0xD7E7187B, bool>(layout)) { log("SKIP invalid layout"); return 0; }
-    int iterator = call<0xD8A12B74, int>(layout);
-    log("SEARCH iterator=%d", iterator);
-    if (!call<0x5A9CC0B0, bool>(iterator)) { log("SKIP invalid iterator"); return 0; }
-    call<0xBE553F84>(iterator, 15); // OBJECT_TYPE_Actor from supplied SDK
-    call<0xF35C5859>(iterator);    // ITERATE_EVERYWHERE
+int selectedTarget(int player) {
+    int candidates[2] = {call<0x0EF7427B,int>(), call<0xD8C8BEA1,int>(player)};
     const Vec3 origin = position(player);
-    float bestDistance = radius * radius;
-    int best = 0;
-    int object = call<0xE96A0318, int>(iterator);
-    int count = 0;
-    while (call<0xD7E7187B, bool>(object) && count++ < 8192) {
-        int actor = call<0x34F0AD96, int>(object);
-        if (actor != player && alive(actor) && call<0x882C84DC, bool>(actor) &&
-            !call<0xB27E91E7, bool>(actor)) {
-            const Vec3 p = position(actor);
-            const float dx = p.x-origin.x, dy = p.y-origin.y, dz = p.z-origin.z;
-            const float distance = dx*dx + dy*dy + dz*dz;
-            if (distance < bestDistance) { best = actor; bestDistance = distance; log("CANDIDATE actor=%d distanceSquared=%.2f", actor, distance); }
-        }
-        object = call<0xD88DC865, int>(iterator);
+    for (int i=0; i<2; ++i) {
+        int actor = candidates[i];
+        if (actor == player || !alive(actor) || !call<0x882C84DC,bool>(actor) ||
+            call<0xB27E91E7,bool>(actor)) continue;
+        const Vec3 v = position(actor);
+        float dx=v.x-origin.x, dy=v.y-origin.y, dz=v.z-origin.z;
+        float distanceSquared=dx*dx+dy*dy+dz*dz;
+        log("TARGET source=%s actor=%d distanceSquared=%.2f", i==0 ? "game-target" : "conversation",actor,distanceSquared);
+        if (distanceSquared<=radius*radius) return actor;
     }
-    call<0xE284A10C>(iterator);
-    if (count > 8192) {
-        log("SKIP actor scan limit reached");
-        return 0;
-    }
-    log("SEARCH complete scanned=%d selected=%d distanceSquared=%.2f", count, best, bestDistance);
-    return best;
+    log("SKIP no living human game/conversation target within %.1f metres",radius);
+    return 0;
 }
 void keyboard(DWORD pressed, WORD, BYTE, BOOL, BOOL alt, BOOL wasDown, BOOL up) {
     if (pressed == key && !alt && !wasDown && !up)
@@ -218,8 +139,7 @@ bool foreground() {
     return pid == GetCurrentProcessId();
 }
 void script() {
-    log("SCRIPT START key=%lu radius=%.1f mode=%s context=%s", key, radius,
-        taskMode ? "Task" : "Speech", context);
+    log("SCRIPT START key=%lu radius=%.1f mode=NativeTauntTask", key, radius);
     ULONGLONG next = 0, beat = 0, observeStart = 0, observeNext = 0;
     int observedPlayer = 0;
     bool wasDown = false;
@@ -248,23 +168,11 @@ void script() {
                 else {
                     bool requested = false;
                     const ULONGLONG started = GetTickCount64();
-                    if (taskMode) {
-                        int target = nearest(player);
-                        if (!alive(target)) log("SKIP task mode: no living NPC within radius");
-                        else {
-                            log("REQUEST task player=%d target=%d parameter=%.1f", player,target,taskSeconds);
-                            call<0x030FB1FA>(player, target, taskSeconds);
-                            requested = true;
-                        }
-                    } else {
-                        int contextId = selectTaunt(player);
-                        if (contextId >= 0) {
-                            // Native context path sets the engine's context flags, unlike
-                            // SAY_SINGLE_LINE_STRING. Backup context IDs use -1 (none).
-                            log("REQUEST context player=%d name=%s id=%d hash=31BAF169", player,context,contextId);
-                            call<0x31BAF169>(player, contextId, -1, true, false, 1, -1, -1, 0, false);
-                            requested = true;
-                        }
+                    int target = selectedTarget(player);
+                    if (alive(target)) {
+                        log("REQUEST TASK_TAUNT_ACTOR_IN_PLACE player=%d target=%d parameter=%.1f",player,target,taskSeconds);
+                        call<0x030FB1FA>(player,target,taskSeconds);
+                        requested = true;
                     }
                     log("ATTEMPT completed elapsed=%llu ms requested=%d", GetTickCount64()-started, requested);
                     // Reserve cooldown even when task lookup fails.
@@ -297,10 +205,6 @@ void config() {
     wchar_t* dot = wcsrchr(path, L'.');
     if (!dot || (dot-path) + 5 >= MAX_PATH) return;
     wcscpy(dot, L".ini");
-    taskMode = GetPrivateProfileIntW(L"TauntKey", L"TaskMode", 0, path) != 0;
-    // Named contexts are intentionally restricted to identifiers found in supplied RDR.exe.
-    if (GetPrivateProfileIntW(L"TauntKey", L"GenericContext", 1, path) == 0)
-        std::strcpy(context, "PLAYER_TAUNT");
     const UINT configuredKey = GetPrivateProfileIntW(L"TauntKey", L"Key", 'F', path);
     if (configuredKey > 0 && configuredKey < 256) key = configuredKey;
     const UINT range = GetPrivateProfileIntW(L"TauntKey", L"RadiusMetres", 8, path);
