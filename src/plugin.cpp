@@ -7,6 +7,7 @@
 #include <type_traits>
 #include <cstdarg>
 #include <cstdio>
+#include "owner_root.h"
 
 namespace {
 using Keyboard = void(*)(DWORD, WORD, BYTE, BOOL, BOOL, BOOL, BOOL);
@@ -65,7 +66,7 @@ void openLog() {
                 nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         }
     }
-    log("ATTACH TauntKey v0.7 native-task; pid=%lu", GetCurrentProcessId());
+    log("ATTACH TauntKey v0.8 target-search; pid=%lu", GetCurrentProcessId());
 }
 
 template<class T> bool resolve(HMODULE mod, T& out, const char* name) {
@@ -113,8 +114,44 @@ Vec3 position(int actor) {
     call<0x99BD9D6F>(actor, &v);
     return v;
 }
+int nearestTarget(int player) {
+    // GET_LAYOUT_FROM_OBJECT is a cast in this game build, not owner traversal.
+    int root=findOwnerRoot(player,
+        [](int h){return call<0x48B36E07,int>(h);},
+        [](int h){return call<0xD7E7187B,bool>(h);});
+    if (!root) { log("SKIP invalid or cyclic owner chain"); return 0; }
+    int type = call<0x261ECB20,int>(root);
+    log("SEARCH root=%d type=%d",root,type);
+    if (type != 1) { log("SKIP search root is not a layout"); return 0; }
+    int iterator = call<0xD8A12B74,int>(root);
+    if (!call<0x5A9CC0B0,bool>(iterator)) { log("SKIP invalid search iterator"); return 0; }
+    call<0xBE553F84>(iterator,15);
+    call<0xF35C5859>(iterator);
+    const Vec3 origin=position(player);
+    float bestDistance=radius*radius;
+    int best=0, count=0;
+    int object=call<0xE96A0318,int>(iterator);
+    while (count<8192 && call<0xD7E7187B,bool>(object)) {
+        ++count;
+        int actor=call<0x34F0AD96,int>(object);
+        if (actor!=player && alive(actor) && call<0x882C84DC,bool>(actor) &&
+            !call<0xB27E91E7,bool>(actor)) {
+            Vec3 v=position(actor);
+            float dx=v.x-origin.x,dy=v.y-origin.y,dz=v.z-origin.z;
+            float distance=dx*dx+dy*dy+dz*dz;
+            if (distance<bestDistance) { best=actor; bestDistance=distance; }
+        }
+        object=call<0xD88DC865,int>(iterator);
+        if ((count%128)==0) hook.wait(0);
+    }
+    call<0xE284A10C>(iterator);
+    if (count==8192) { log("SKIP search limit reached"); return 0; }
+    log("SEARCH scanned=%d selected=%d distanceSquared=%.2f",count,best,bestDistance);
+    return best;
+}
 int selectedTarget(int player) {
     int candidates[2] = {call<0x0EF7427B,int>(), call<0xD8C8BEA1,int>(player)};
+    log("TARGET raw game=%d conversation=%d",candidates[0],candidates[1]);
     const Vec3 origin = position(player);
     for (int i=0; i<2; ++i) {
         int actor = candidates[i];
@@ -126,8 +163,9 @@ int selectedTarget(int player) {
         log("TARGET source=%s actor=%d distanceSquared=%.2f", i==0 ? "game-target" : "conversation",actor,distanceSquared);
         if (distanceSquared<=radius*radius) return actor;
     }
-    log("SKIP no living human game/conversation target within %.1f metres",radius);
-    return 0;
+    int nearest=nearestTarget(player);
+    if (!alive(nearest)) log("SKIP no living human target within %.1f metres",radius);
+    return nearest;
 }
 void keyboard(DWORD pressed, WORD, BYTE, BOOL, BOOL alt, BOOL wasDown, BOOL up) {
     if (pressed == key && !alt && !wasDown && !up)
@@ -175,8 +213,7 @@ void script() {
                         requested = true;
                     }
                     log("ATTEMPT completed elapsed=%llu ms requested=%d", GetTickCount64()-started, requested);
-                    // Reserve cooldown even when task lookup fails.
-                    next = GetTickCount64() + cooldown;
+                    next = GetTickCount64() + (requested ? cooldown : 250);
                     if (requested) {
                         observedPlayer = player;
                         observeStart = GetTickCount64();
